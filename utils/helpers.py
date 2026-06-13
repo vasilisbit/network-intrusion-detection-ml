@@ -206,6 +206,206 @@ def drop_duplicates_report(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return cleaned, before - len(cleaned)
 
 
+def kmeans_result_is_pathological(
+    X, labels, sample_size: int = 20_000, seed: int = 42,
+    min_frac: float = 0.001, sil_threshold: float = 0.9,
+) -> bool:
+    """
+    Detect the *specific* cuML/intelex KMeans degeneracy: a clustering where a
+    near-empty cluster (a handful of outliers) produces an artificially HIGH
+    silhouette that would hijack best-k selection.
+
+    Why both conditions are required
+    --------------------------------
+    A tiny cluster ALONE is not pathological: at k >= 10 even stock sklearn
+    produces sub-0.1% clusters here, because the rare attack classes are
+    genuinely tiny (Heartbleed = 11 rows = 0.002% of 500K). Flagging on tiny
+    cluster alone caused pointless CPU refits at every high k.
+
+    The real poison is a tiny cluster *combined with* an implausibly high
+    silhouette (e.g. cuML k=2 -> [149998, 2] with silhouette ~0.98). That
+    fake score beats the true peak and corrupts the argmax. So we fire only
+    when a cluster is < ``min_frac`` of the points AND the silhouette exceeds
+    ``sil_threshold`` (0.9 is far above anything this dataset legitimately
+    reaches, ~0.45-0.57).
+
+    Returns True only when BOTH hold.
+    """
+    from sklearn.metrics import silhouette_score
+
+    labels = np.asarray(labels)
+    counts = np.bincount(labels)
+    counts = counts[counts > 0]
+    if len(counts) < 2:
+        return False  # single cluster -> not this pathology
+    tiny = (counts.min() / len(labels)) < min_frac
+    if not tiny:
+        return False  # no near-empty cluster -> healthy regardless of score
+    X_arr = np.asarray(X)
+    n = min(sample_size, len(X_arr))
+    sil = silhouette_score(X_arr, labels, sample_size=n, random_state=seed)
+    return bool(sil > sil_threshold)
+
+
+# =============================================================================
+# Subsampling to a target size (rare-class-aware)
+# =============================================================================
+def subsample_to_target(
+    y: np.ndarray,
+    target_rows: int | None = None,
+    target_frac: float | None = None,
+    rare_floor: int = 1_000,
+    balanced: bool = False,
+    random_state: int = RANDOM_STATE,
+) -> np.ndarray:
+    """
+    Pick row indices so the kept set has ~``target_rows`` rows, while
+    protecting rare classes. Returns a sorted array of integer indices into
+    ``y`` (so callers do ``X.iloc[idx]``, ``y[idx]``).
+
+    Strategy (why this and not plain proportional sampling)
+    -------------------------------------------------------
+    CIC-IDS-2017 is pathologically imbalanced: BENIGN is ~83% while three
+    attack classes have 11-36 rows total. A *purely* proportional sample to,
+    say, 134K rows would reduce Heartbleed (11) and SQL Injection (21) to
+    ~1 row each - unsplittable for train/test and fatal for StratifiedKFold
+    (which needs >= n_splits members per class). It would also spend ~83% of
+    the budget re-copying BENIGN, i.e. keep the expensive majority and throw
+    away the cheap, informative minority.
+
+    So we use a *floored* proportional scheme:
+      1. Classes with <= ``rare_floor`` rows are kept IN FULL (reserved).
+      2. The remaining budget (target - reserved) is split among the large
+         classes IN PROPORTION to their true sizes (preserves the realistic
+         prior among the common classes).
+      3. If a large class is smaller than its proportional share, it is taken
+         in full and its leftover budget is redistributed to the others
+         (iteratively), so the final total still hits the target.
+      4. Largest-remainder rounding makes the per-class integer allocations
+         sum exactly to the achievable target.
+
+    Class-level imbalance during *training* is handled separately by
+    ``class_weight='balanced'`` - this function only controls dataset SIZE.
+
+    Parameters
+    ----------
+    y : array of encoded labels (ints).
+    target_rows : desired total rows. Mutually exclusive with target_frac.
+    target_frac : desired fraction of len(y) in (0, 1]. Used if target_rows
+        is None.
+    rare_floor : classes with count <= this are always kept fully.
+    balanced : if True, the budget for the large classes is split EVENLY
+        (equal cap per big class) instead of proportionally to their true
+        sizes. Rare classes (<= rare_floor) are still kept in full. This
+        produces a roughly class-balanced sample of ~target_rows rows, which
+        is what Q3 clustering wants: a proportional sample is ~83% BENIGN, so
+        the PCA scatter is one overlapping blob and K-Means' best silhouette
+        degenerates to k=2 (normal-vs-anomalous). An even split exposes the
+        per-attack structure (best k ~ #classes) and gives readable plots.
+        Q2 classification leaves this False (the realistic prior is the point).
+    random_state : seed for the per-class random choice (reproducible).
+
+    Returns
+    -------
+    np.ndarray : sorted indices to keep. If neither target is given (or the
+        target >= len(y)), returns all indices (no subsampling).
+    """
+    y = np.asarray(y)
+    n_total = len(y)
+
+    # Resolve the target -----------------------------------------------------
+    if target_rows is None and target_frac is None:
+        return np.arange(n_total)
+    if target_rows is None:
+        if not (0 < target_frac <= 1):
+            raise ValueError("target_frac must be in (0, 1].")
+        target_rows = int(round(target_frac * n_total))
+    if target_rows >= n_total:
+        return np.arange(n_total)
+    if target_rows <= 0:
+        raise ValueError("target_rows must be positive.")
+
+    classes, counts = np.unique(y, return_counts=True)
+    count_of = dict(zip(classes.tolist(), counts.tolist()))
+
+    # 1) Reserve rare classes in full ---------------------------------------
+    rare = [c for c in classes if count_of[c] <= rare_floor]
+    big = [c for c in classes if count_of[c] > rare_floor]
+    alloc = {c: count_of[c] for c in rare}
+    reserved = sum(alloc.values())
+
+    budget = target_rows - reserved
+    if budget <= 0:
+        # Even the rare classes alone meet/exceed the target. Keep rares
+        # fully (we never drop rares) and take nothing extra from big classes.
+        alloc.update({c: 0 for c in big})
+    elif balanced:
+        # EVEN split: every big class gets the same cap (~budget/n_big). If a
+        # class is smaller than the cap it is taken in full and its leftover is
+        # redistributed to the others, so the total still hits the target.
+        remaining_big = list(big)
+        big_budget = budget
+        final_big = {}
+        while remaining_big:
+            cap = big_budget / len(remaining_big)
+            small = [c for c in remaining_big if count_of[c] <= cap]
+            if small:
+                for c in small:
+                    final_big[c] = count_of[c]
+                    big_budget -= count_of[c]
+                    remaining_big.remove(c)
+                continue
+            base = int(np.floor(cap))
+            alloc_big = {c: base for c in remaining_big}
+            short = big_budget - base * len(remaining_big)
+            # hand out the rounding remainder deterministically (largest class first)
+            for c in sorted(remaining_big, key=lambda c: count_of[c], reverse=True)[:short]:
+                alloc_big[c] += 1
+            final_big.update(alloc_big)
+            break
+        alloc.update(final_big)
+    else:
+        # 2-3) Proportional split among big classes, with overflow
+        #      redistribution when a class is smaller than its share.
+        remaining_big = list(big)
+        big_budget = budget
+        final_big = {}
+        while remaining_big:
+            pool = sum(count_of[c] for c in remaining_big)
+            # ideal real-valued share for each remaining class
+            ideal = {c: big_budget * count_of[c] / pool for c in remaining_big}
+            # any class whose ideal share exceeds its size -> cap it, recurse
+            capped = [c for c in remaining_big if ideal[c] >= count_of[c]]
+            if capped:
+                for c in capped:
+                    final_big[c] = count_of[c]
+                    big_budget -= count_of[c]
+                    remaining_big.remove(c)
+                continue
+            # no more capping needed: largest-remainder rounding on `ideal`
+            floors = {c: int(np.floor(ideal[c])) for c in remaining_big}
+            short = big_budget - sum(floors.values())
+            remainders = sorted(
+                remaining_big, key=lambda c: ideal[c] - floors[c], reverse=True
+            )
+            for c in remainders[:short]:
+                floors[c] += 1
+            final_big.update(floors)
+            break
+        alloc.update(final_big)
+
+    # 4) Draw the actual indices --------------------------------------------
+    rng = np.random.default_rng(random_state)
+    keep = []
+    for c in classes:
+        idx = np.where(y == c)[0]
+        k = alloc.get(c, 0)
+        if k < len(idx):
+            idx = rng.choice(idx, size=k, replace=False)
+        keep.append(idx)
+    return np.sort(np.concatenate(keep)) if keep else np.array([], dtype=int)
+
+
 def save_figure(fig, name: str, dpi: int = 120) -> Path:
     """Save a matplotlib figure under outputs/figures/ with consistent settings."""
     out = FIGURES_DIR / name
@@ -551,12 +751,19 @@ def plot_one_forest_tree(
 # Q3 clustering helpers — used by notebooks/q3_clustering.ipynb.
 # =============================================================================
 def evaluate_clustering(
-    X, labels_pred, sample_size: int = 10_000,
+    X, labels_pred, sample_size: int = 20_000,
     seed: int = 42,
 ) -> dict:
     """
     Silhouette score (sampled for speed) + Davies-Bouldin index for a
     clustering result.
+
+    Why silhouette is sampled but Davies-Bouldin is not: silhouette is
+    O(n^2) (it needs all pairwise distances), so at hundreds of thousands /
+    millions of rows the full computation is infeasible on ANY hardware -
+    the sample is a statistical estimate (within ~+/-0.01 at 20K), not a
+    hardware shortcut. Davies-Bouldin is O(n*k*d) (linear in n), so it runs
+    on the FULL data here with no cap, even at multi-million rows.
 
     Why sampled silhouette: the standard silhouette is
     :math:`O(n^2)` in memory and pairwise distances. On 134K rows that
@@ -696,6 +903,8 @@ def plot_pca_scatter_comparison(
     X_pca_2d, cluster_labels, true_labels, class_names,
     title: str, fname: str,
     cluster_palette: str = "tab20",
+    plot_sample_size: int | None = 50_000,
+    seed: int = 42,
 ):
     """
     Side-by-side 2-D PCA scatter: left colored by cluster label, right
@@ -704,12 +913,30 @@ def plot_pca_scatter_comparison(
     supervised classes.
 
     DBSCAN noise points (label ``-1``) are drawn as grey x-markers.
+
+    For large datasets we plot only a uniform random sample of
+    ``plot_sample_size`` points (default 50K). This is a *rendering* limit,
+    not an analytical one: a 2-D scatter saturates visually at a few tens of
+    thousands of points (everything overlaps into a blob) and a million-point
+    PNG is huge and slow. All metrics (silhouette, Davies-Bouldin, the
+    cluster-to-label heatmap) are computed elsewhere on the FULL data, so the
+    plot sample changes nothing that gets reported. Set to ``None`` to plot
+    every point.
     """
     import matplotlib.pyplot as plt
 
     cluster_labels = np.asarray(cluster_labels)
     true_labels = np.asarray(true_labels)
     X_pca_2d = np.asarray(X_pca_2d)
+
+    # Rendering subsample (uniform, reproducible). Metrics are unaffected -
+    # they are computed on the full arrays before this function is called.
+    if plot_sample_size is not None and len(X_pca_2d) > plot_sample_size:
+        rng = np.random.default_rng(seed)
+        sub = rng.choice(len(X_pca_2d), size=plot_sample_size, replace=False)
+        X_pca_2d = X_pca_2d[sub]
+        cluster_labels = cluster_labels[sub]
+        true_labels = true_labels[sub]
 
     fig, (ax_c, ax_t) = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
 

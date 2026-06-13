@@ -7,6 +7,28 @@ scipy>=1.11
 scikit-learn>=1.3      # models, GridSearchCV, metrics, StandardScaler, PCA
 imbalanced-learn>=0.11 # SMOTE and other resampling (optional for Q2)
 
+# Optional: Intel CPU acceleration (oneDAL backend), used in Q2 only (RandomForest/
+# LogisticRegression). Notebooks call patch_sklearn() inside a try/except, so this is
+# NOT required to run them - it just makes Q2 training faster on Intel CPUs.
+# NOTE: deliberately NOT patched in Q3 - its KMeans produced a degenerate clustering
+# here (see q3 notebook markdown). Skip on non-Intel hardware.
+scikit-learn-intelex>=2025.0 ; platform_machine == "x86_64" or platform_machine == "AMD64"
+
+# Optional: NVIDIA GPU acceleration for Q3 via RAPIDS cuML (DBSCAN + KMeans + PCA).
+# NOT pip-installable on Windows - it requires Linux or WSL2. The q3 notebook
+# auto-detects cuML and falls back to scikit-learn if absent, so this is optional.
+# NOTE: cuML KMeans is forced to init='k-means++' (its default 'scalable-k-means++'
+# gave a degenerate clustering here) and is wrapped in a runtime auto-guard that
+# refits any degenerate k on CPU. cuML PCA is numerically identical to sklearn.
+# This let us scale Q3 to TARGET_ROWS=1,000,000 (peak ~1.4 GB VRAM, k-search ~2s).
+# Setup used (WSL2 Ubuntu-24.04, NVIDIA driver >= 525, CUDA 12; RTX 2060 / compute 7.5):
+#   python3 -m venv ~/rapids-env && source ~/rapids-env/bin/activate
+#   pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12
+#   python -m ipykernel install --user --name rapids-gpu --display-name "Python (RAPIDS GPU)"
+# Measured: full DBSCAN eps/min_samples sweep ~1 min on GPU vs ~58 min on CPU (~100x on
+# the heaviest config). Run the q3 notebook with the "rapids-gpu" kernel to use it.
+# cuml-cu12>=26.04 ; platform_system == "Linux"   # install in WSL2 per the steps above
+
 # === Visualization ===
 matplotlib>=3.7
 seaborn>=0.12
